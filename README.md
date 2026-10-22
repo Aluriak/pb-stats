@@ -85,7 +85,7 @@ The `-debug` archives of the nightly release hold a build that writes a log:
 
 1. Copy `Reading Stats.bin` and `stats-debug.app` into the `applications` folder.
 2. Open "stats-debug" instead of "Reading Stats".
-3. The log is written to `reading-stats-log.txt` at the top of the reader's storage.
+3. The log is written to `reading-stats-log.txt` in the `system` folder of the reader (out of the library, which takes text files for books).
 
 ## Development
 
