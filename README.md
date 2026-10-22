@@ -87,6 +87,12 @@ is read.
 SQLite is built into the app: `vendor/sqlite` holds the amalgamation of SQLite 3.53.4, see
 `vendor/sqlite/README.md`.
 
+### Releases
+
+Every push to `main` replaces the nightly release. To publish a stable release, set the new
+version in `build.zig.zon` and push it to `main`: the build workflow sees that this version has
+no release yet and publishes one, tagged `v<version>`.
+
 ## Licence
 
 GPL-3.0, see [LICENSE](LICENSE). SQLite is in the public domain.

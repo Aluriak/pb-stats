@@ -1,7 +1,8 @@
 # Checks and builds the app on every push. Each push to main replaces the "nightly"
 # release, so the latest build is always at the same address:
 # https://github.com/<owner>/<repo>/releases/download/nightly/reading-stats-<platform>.zip
-# A tag v<version> (matching build.zig.zon) publishes a release.
+# A push to main with a version in build.zig.zon that has no release yet publishes it;
+# so does a tag v<version> matching it.
 name: Build
 
 on:
@@ -35,13 +36,21 @@ jobs:
           echo /opt/zig >> "$GITHUB_PATH"
 
       - name: Decide the kind of build
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           version="$(sed -n 's/^ *\.version = "\(.*\)",.*/\1/p' build.zig.zon)"
           # The app compares these with what is published when it looks for an update
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$GITHUB_REF_NAME" ]; then
             kind=release; tag="$GITHUB_REF_NAME"
           elif [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
-            kind=nightly; tag=nightly
+            # A version of build.zig.zon that has no release yet is released by this push,
+            # the next pushes make nightly builds again
+            if gh release view "v$version" > /dev/null 2>&1; then
+              kind=nightly; tag=nightly
+            else
+              kind=release; tag="v$version"
+            fi
           else
             kind=dev; tag=
           fi
@@ -53,7 +62,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Check that a release tag matches the version
-        if: env.KIND == 'release'
+        if: env.KIND == 'release' && github.ref_type == 'tag'
         run: |
           if [ "$GITHUB_REF_NAME" != "v$APP_VERSION" ]; then
             echo "Tag $GITHUB_REF_NAME does not match version $APP_VERSION in build.zig.zon"
@@ -121,7 +130,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag \
-            --title "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
             --notes "Version ${APP_VERSION}. Unzip and copy \`Reading Stats.app\` into the \`applications\` folder of your PocketBook."
