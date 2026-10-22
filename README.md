@@ -6,12 +6,20 @@ The reader keeps track of every book's progress but shows no statistics. Reading
 the reader's library and shows:
 
 * **Reading:** the books you are reading, how far you are and when you last read them.
-* **Finished:** the books you finished, with the date, and how many this month.
+  Each book opens on its sheet: progress, since when the journal follows it, your pace over
+  the last month (in pages a day) and when you would finish it at that pace.
+* **Finished:** the books you finished, with the date, and how many this month. Their sheet
+  says how many days you took, when the journal saw the book from its start.
+* **Goal:** a number of books to finish this year, with how far you are and whether you are
+  ahead of a steady pace. Touch it to set it (0 removes it); it is kept as `goal=` in
+  `system/config/reading-stats.cfg`.
+* **Year in review:** books and pages finished, reading days, the longest book, the most read
+  author, the best month, the books finished per month, and the years before.
 * **Not started:** the books in your library you never opened.
-* **Activity:** reading days in the last 30 days, your current streak, and the progress of each
-  book over time.
-* **Library:** books on the reader and in the cloud, books finished and added per month,
-  authors, series and formats.
+* **Activity:** reading days in the last 30 days, drawn as a row of squares, your current
+  streak, and the progress of each book over time.
+* **Library:** books on the reader and in the cloud, books finished and added per month as
+  bars, authors, series and formats.
 * **Updates:** the app updates itself from its GitHub releases, when you ask for it.
 
 The manuals that come with the reader are left out.
@@ -22,8 +30,9 @@ The manuals that come with the reader are left out.
    [nightly release](https://github.com/Aluriak/pb-stats/releases/tag/nightly):
    `reading-stats-allwinner.zip` for most readers (Era, Verse, InkPad 4, Vivlio Light HD Color…),
    `reading-stats-rk3566.zip` for Verta, InkPad One and PocketBook Q.
-2. Unzip it and copy `Reading Stats.app` into the `applications` folder of the reader.
-3. Open "Reading Stats" from the applications list.
+2. Unzip it and copy the `.app` file into the `applications` folder of the reader,
+   or install it with the [App Manager](https://github.com/Aluriak/pb-apps).
+3. Open it from the applications list.
 
 ## Updates
 

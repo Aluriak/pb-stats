@@ -102,6 +102,74 @@ fn sortedMonths(allocator: std.mem.Allocator, counts: std.AutoArrayHashMapUnmana
     return list;
 }
 
+/// What a year of reading was
+pub const Year = struct {
+    finished: usize = 0,
+    /// Pages of the books finished, for those whose number of pages is known
+    pages: u64 = 0,
+    /// The finished book with the most pages
+    longest: ?Book = null,
+    /// The author with the most books finished, if one has more than one
+    top_author: ?NameCount = null,
+    /// Books finished in each month, January first
+    per_month: [12]usize = @splat(0),
+};
+
+/// The day a book was finished, null if not finished or the date is unknown
+pub fn finishedDay(book: Book, utc_offset: i32) ?dates.Day {
+    const progress = book.progress orelse return null;
+    if (!progress.completed or progress.completed_at == 0) return null;
+    return dates.dayOf(progress.completed_at, utc_offset);
+}
+
+pub fn yearSummary(allocator: std.mem.Allocator, books: []const Book, year: i32, utc_offset: i32) !Year {
+    var result: Year = .{};
+    var finished: std.ArrayList(Book) = .empty;
+    defer finished.deinit(allocator);
+    for (books) |book| {
+        const finished_on = finishedDay(book, utc_offset) orelse continue;
+        const date = dates.dateOf(finished_on);
+        if (date.year != year) continue;
+        try finished.append(allocator, book);
+        result.finished += 1;
+        result.per_month[date.month - 1] += 1;
+        const pages = book.progress.?.pages;
+        result.pages += pages;
+        if (pages > 0 and (result.longest == null or pages > result.longest.?.progress.?.pages)) result.longest = book;
+    }
+    const by_author = try authors(allocator, finished.items);
+    defer allocator.free(by_author);
+    if (by_author.len > 0 and by_author[0].count > 1) result.top_author = by_author[0];
+    return result;
+}
+
+/// The years books were finished in, the latest first
+pub fn finishedYears(allocator: std.mem.Allocator, books: []const Book, utc_offset: i32) ![]i32 {
+    var years: std.ArrayList(i32) = .empty;
+    for (books) |book| {
+        const finished_on = finishedDay(book, utc_offset) orelse continue;
+        const year = dates.dateOf(finished_on).year;
+        if (std.mem.indexOfScalar(i32, years.items, year) == null) try years.append(allocator, year);
+    }
+    std.mem.sort(i32, years.items, {}, std.sort.desc(i32));
+    return years.toOwnedSlice(allocator);
+}
+
+/// Where a yearly goal stands on `today`
+pub const GoalPace = struct {
+    /// Books that should be finished by now to reach the goal at a steady pace
+    expected: usize,
+    /// Books ahead of that pace, negative when behind
+    ahead: i64,
+};
+
+pub fn goalPace(finished: usize, goal: usize, today: dates.Day) GoalPace {
+    const year = dates.dateOf(today).year;
+    const elapsed: usize = @intCast(today - dates.yearStart(year) + 1);
+    const expected = goal * elapsed / @as(usize, @intCast(dates.daysInYear(year)));
+    return .{ .expected = expected, .ahead = @as(i64, @intCast(finished)) - @as(i64, @intCast(expected)) };
+}
+
 pub const NameCount = struct { name: []const u8, count: usize };
 
 /// Authors by number of books, then by name
@@ -203,6 +271,30 @@ test "authors are sorted by number of books, then by name" {
     try std.testing.expectEqualStrings("Liu Cixin", list[0].name);
     try std.testing.expectEqual(2, list[0].count);
     try std.testing.expectEqualStrings("Caroline Bouffault", list[1].name);
+}
+
+test "a year sums up the books finished in it" {
+    var books = testBooks();
+    books[0].progress.?.completed = true;
+    books[0].progress.?.completed_at = now - 400 * day;
+    const year = try yearSummary(std.testing.allocator, &books, 2026, 0);
+    try std.testing.expectEqual(1, year.finished);
+    try std.testing.expectEqual(225, year.pages);
+    try std.testing.expectEqual(9, year.longest.?.id);
+    try std.testing.expectEqual(1, year.per_month[9]);
+    try std.testing.expectEqual(null, year.top_author);
+
+    const years = try finishedYears(std.testing.allocator, &books, 0);
+    defer std.testing.allocator.free(years);
+    try std.testing.expectEqualSlices(i32, &.{ 2026, 2025 }, years);
+}
+
+test "goalPace compares with a steady pace over the year" {
+    // 2026-10-22 is day 295 of 365: 24 books a year means 19 by now
+    const today = dates.dayOf(now, 0);
+    try std.testing.expectEqual(GoalPace{ .expected = 19, .ahead = 1 }, goalPace(20, 24, today));
+    try std.testing.expectEqual(GoalPace{ .expected = 19, .ahead = -4 }, goalPace(15, 24, today));
+    try std.testing.expectEqual(@as(usize, 0), goalPace(0, 12, dates.yearStart(2026)).expected);
 }
 
 test "books without a series are not a series" {

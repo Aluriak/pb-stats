@@ -34,6 +34,26 @@ pub fn dateOf(day: Day) Date {
     return .{ .year = @intCast(y), .month = @intCast(m), .day = @intCast(d) };
 }
 
+/// The day number of a date (Howard Hinnant's days_from_civil)
+pub fn dayFromDate(date: Date) Day {
+    const y: i64 = @as(i64, date.year) - @as(i64, if (date.month <= 2) 1 else 0);
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const m: i64 = date.month;
+    const doy = @divFloor(153 * (if (m > 2) m - 3 else m + 9) + 2, 5) + date.day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return @intCast(era * 146097 + doe - 719468);
+}
+
+/// The first day of `year`
+pub fn yearStart(year: i32) Day {
+    return dayFromDate(.{ .year = year, .month = 1, .day = 1 });
+}
+
+pub fn daysInYear(year: i32) i32 {
+    return yearStart(year + 1) - yearStart(year);
+}
+
 /// A month as one number, for grouping: year * 12 + month - 1
 pub const Month = i32;
 
@@ -112,6 +132,14 @@ test "dayOf moves late evening to the next day east of Greenwich" {
     const late: i64 = 1792625400;
     try std.testing.expectEqual(@as(u8, 21), dateOf(dayOf(late, 0)).day);
     try std.testing.expectEqual(@as(u8, 22), dateOf(dayOf(late, 2 * 3600)).day);
+}
+
+test "dayFromDate is the inverse of dateOf" {
+    for ([_]Day{ 0, 11016, 20748, -1, 365 * 30 + 7 }) |day| {
+        try std.testing.expectEqual(day, dayFromDate(dateOf(day)));
+    }
+    try std.testing.expectEqual(@as(i32, 366), daysInYear(2028));
+    try std.testing.expectEqual(@as(i32, 365), daysInYear(2026));
 }
 
 test "months group and print" {

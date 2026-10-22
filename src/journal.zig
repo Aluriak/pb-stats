@@ -131,6 +131,87 @@ pub fn activity(allocator: std.mem.Allocator, records: []const Record, today: da
     return result;
 }
 
+/// The days with reading among the last `n` (at most 32) up to today: bit i is set when
+/// there was reading `i` days ago
+pub fn recentDays(records: []const Record, today: dates.Day, utc_offset: i32, n: u5) u32 {
+    var mask: u32 = 0;
+    for (records) |record| {
+        const ago = today - dates.dayOf(record.time, utc_offset);
+        if (ago >= 0 and ago < n) mask |= @as(u32, 1) << @intCast(ago);
+    }
+    return mask;
+}
+
+/// The number of days with reading in `year`
+pub fn readingDaysIn(allocator: std.mem.Allocator, records: []const Record, year: i32, utc_offset: i32) !usize {
+    var days: std.AutoHashMapUnmanaged(dates.Day, void) = .empty;
+    defer days.deinit(allocator);
+    for (records) |record| {
+        const day = dates.dayOf(record.time, utc_offset);
+        if (dates.dateOf(day).year == year) try days.put(allocator, day, {});
+    }
+    return days.count();
+}
+
+/// How a book is being read, from its records
+pub const Pace = struct {
+    /// The first record of the book, and how far it was then
+    since: dates.Day,
+    since_permille: u16,
+    /// The latest record
+    last: dates.Day,
+    permille: u16,
+    /// Thousandths read per day over the last month (or since the first record)
+    per_day: f32,
+    /// When the book would be finished at that pace, null when it does not move
+    finish: ?dates.Day,
+};
+
+/// Days the pace is measured over
+const pace_window = 30;
+
+pub fn pace(records: []const Record, book: i64, today: dates.Day, utc_offset: i32) ?Pace {
+    var first: ?Record = null;
+    var last: ?Record = null;
+    for (records) |record| {
+        if (record.book != book) continue;
+        if (first == null or record.time < first.?.time) first = record;
+        if (last == null or record.time >= last.?.time) last = record;
+    }
+    const start = first orelse return null;
+    const end = last.?;
+
+    // The pace starts from the last record before the window, so a month of reading counts
+    // fully and the time without reading since counts too
+    const window_start = today - pace_window;
+    var base = start;
+    for (records) |record| {
+        if (record.book != book) continue;
+        if (dates.dayOf(record.time, utc_offset) < window_start and record.time > base.time) base = record;
+    }
+
+    const end_day = dates.dayOf(end.time, utc_offset);
+    const base_day = dates.dayOf(base.time, utc_offset);
+    const span: f32 = @floatFromInt(@max(1, today - base_day));
+    const gained: f32 = @floatFromInt(@as(i32, end.permille) - @as(i32, base.permille));
+    const per_day = @max(0, gained / span);
+
+    const finish: ?dates.Day = if (end.permille >= 1000)
+        end_day
+    else if (per_day > 0)
+        today + @as(dates.Day, @intFromFloat(@ceil(@as(f32, @floatFromInt(1000 - end.permille)) / per_day)))
+    else
+        null;
+    return .{
+        .since = dates.dayOf(start.time, utc_offset),
+        .since_permille = start.permille,
+        .last = end_day,
+        .permille = end.permille,
+        .per_day = per_day,
+        .finish = finish,
+    };
+}
+
 /// Reads the journal file, an empty journal if there is none.
 /// Through libc: Zig's own file layer makes system calls the reader's kernel lacks.
 pub fn load(allocator: std.mem.Allocator, path: [:0]const u8) ![]Record {
@@ -162,6 +243,40 @@ pub fn append(path: [:0]const u8, records: []const Record) !void {
 
 const day_seconds = std.time.s_per_day;
 const now: i64 = 1792698480; // 2026-10-22 19:48 UTC
+
+test "recentDays marks the days with reading" {
+    const today = dates.dayOf(now, 0);
+    const records = [_]Record{
+        .{ .time = now, .book = 1, .permille = 10, .title = "" },
+        .{ .time = now - 2 * day_seconds, .book = 1, .permille = 5, .title = "" },
+        .{ .time = now - 40 * day_seconds, .book = 1, .permille = 1, .title = "" },
+    };
+    try std.testing.expectEqual(@as(u32, 0b101), recentDays(&records, today, 0, 30));
+    try std.testing.expectEqual(2, try readingDaysIn(std.testing.allocator, records[0..2], 2026, 0));
+}
+
+test "pace measures the last month and estimates the end" {
+    const today = dates.dayOf(now, 0);
+    const records = [_]Record{
+        .{ .time = now - 60 * day_seconds, .book = 1, .permille = 100, .title = "" },
+        .{ .time = now - 31 * day_seconds, .book = 1, .permille = 200, .title = "" },
+        .{ .time = now - 10 * day_seconds, .book = 1, .permille = 500, .title = "" },
+        .{ .time = now - 1 * day_seconds, .book = 1, .permille = 500, .title = "" },
+        .{ .time = now, .book = 2, .permille = 900, .title = "" },
+    };
+    const book = pace(&records, 1, today, 0).?;
+    try std.testing.expectEqual(today - 60, book.since);
+    try std.testing.expectEqual(100, book.since_permille);
+    // 300 thousandths in the 31 days since the record before the window
+    try std.testing.expectApproxEqAbs(@as(f32, 300.0 / 31.0), book.per_day, 0.001);
+    // 500 left at about 9.7 a day
+    try std.testing.expectEqual(today + 52, book.finish.?);
+
+    // One record only: no pace yet
+    const other = pace(&records, 2, today, 0).?;
+    try std.testing.expectEqual(null, other.finish);
+    try std.testing.expectEqual(null, pace(&records, 3, today, 0));
+}
 
 test "parse reads lines and skips broken ones" {
     const text = "1792628940\t9\t1000\tLe Temps d'après\nbroken line\n1792698480\t7\t10\tDungeon Crawler Carl\r\n";

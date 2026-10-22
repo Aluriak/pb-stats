@@ -23,12 +23,34 @@ const Row = struct {
     opens: ?Action = null,
     /// A heading between parts of a list, not a book
     heading: bool = false,
+    /// Drawn on the second line, after the detail
+    chart: Chart = .none,
 };
 
-const List = enum { reading, finished, unread, activity, library };
+const Chart = union(enum) {
+    none,
+    /// A bar as long as `value` is of `max`
+    bar: struct { value: usize, max: usize },
+    /// The days of the last month, the oldest first: bit i is set when there was reading
+    /// i days ago
+    days: u32,
+};
 
-/// What opening a row does: open a list, look for an update, or change the language
-const Action = union(enum) { list: List, update, language };
+/// The screens of the app
+const Page = union(enum) {
+    start,
+    reading,
+    finished,
+    unread,
+    activity,
+    library,
+    /// The sheet of a book, by its index in `books`
+    book: usize,
+    year: i32,
+};
+
+/// What opening a row does: open a page, look for an update, change the language or the goal
+const Action = union(enum) { page: Page, update, language, goal };
 
 /// A list on screen. Opening a row pushes one, Back pops it
 const Screen = struct {
@@ -60,6 +82,38 @@ var heading_font: ?*pb.ifont = null;
 const config_path = "/mnt/ext1/system/config/reading-stats.cfg";
 
 var language: i18n.Choice = .auto;
+/// Books to finish this year, 0 for no goal
+var goal: usize = 0;
+
+fn readGoal() usize {
+    const config = pb.OpenConfig(config_path, null) orelse return 0;
+    defer pb.CloseConfigNoSave(config);
+    return @intCast(@max(0, pb.ReadInt(config, "goal", 0)));
+}
+
+/// What the user types as goal
+var goal_text: [8]u8 = undefined;
+var goal_title: [96]u8 = undefined;
+
+fn openGoalKeyboard() void {
+    const title = i18n.fmt(&goal_title, .goal_keyboard, .{dates.dateOf(today).year});
+    goal_text = @splat(0);
+    if (goal > 0) _ = std.fmt.bufPrint(goal_text[0 .. goal_text.len - 1], "{d}", .{goal}) catch {};
+    pb.OpenKeyboard(title.ptr, &goal_text, goal_text.len - 1, pb.KBD_NUMERIC, goalEntered);
+}
+
+/// Called by InkView when the keyboard closes, without a text if it was cancelled
+fn goalEntered(typed: [*c]u8) callconv(.c) void {
+    if (typed == null) return showList();
+    const text = std.mem.trim(u8, std.mem.span(typed), " ");
+    goal = std.fmt.parseInt(u16, text, 10) catch 0;
+    if (pb.OpenConfig(config_path, null)) |config| {
+        pb.WriteInt(config, "goal", @intCast(goal));
+        _ = pb.SaveConfig(config);
+        pb.CloseConfig(config);
+    }
+    rebuildStart();
+}
 
 extern "c" fn currentLang() ?[*:0]const u8;
 
@@ -83,7 +137,12 @@ fn changeLanguage() void {
         pb.CloseConfig(config);
     }
     applyLanguage();
-    // The start screen is the only one open: built again in the new language
+    rebuildStart();
+}
+
+/// Builds the start screen again, the only one open, keeping the selected row
+fn rebuildStart() void {
+    const pos = screens.items[0].pos;
     while (screens.pop()) |screen| {
         var closed = screen;
         closed.arena.deinit();
@@ -92,7 +151,7 @@ fn changeLanguage() void {
         pb.CloseApp();
         return;
     };
-    screens.items[0].pos = startRowCount() - 1;
+    screens.items[0].pos = @min(pos, startRowCount() - 1);
     showList();
 }
 
@@ -147,6 +206,7 @@ fn mainHandler(event_type: c_int, par1: c_int, _: c_int) callconv(.c) c_int {
         pb.EVT_INIT => {
             language = readLanguage();
             applyLanguage();
+            goal = readGoal();
 
             item_height = @divTrunc(pb.ScreenHeight(), 10);
             padding = @divTrunc(item_height, 8);
@@ -181,8 +241,6 @@ fn mainHandler(event_type: c_int, par1: c_int, _: c_int) callconv(.c) c_int {
     return 0;
 }
 
-const Page = enum { start, reading, finished, unread, activity, library };
-
 fn pushScreen(page: Page) !void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
@@ -194,6 +252,8 @@ fn pushScreen(page: Page) !void {
         .unread => .{ t(.unread), try unreadRows(allocator) },
         .activity => .{ t(.activity), try activityRows(allocator) },
         .library => .{ t(.library), try libraryRows(allocator) },
+        .book => |index| .{ try z(allocator, books[index].title), try bookRows(allocator, books[index]) },
+        .year => |year| .{ try i18n.alloc(allocator, .year_title, .{year}), try yearRows(allocator, year) },
     };
     try screens.append(gpa, .{ .arena = arena, .title = title, .rows = list });
 }
@@ -217,8 +277,8 @@ fn listHandler(action: c_int, x: c_int, y: c_int, idx: c_int, state: c_int) call
             screen.pos = idx;
             const row = screen.rows[@intCast(idx)];
             const opens = row.opens orelse return 1;
-            const list = switch (opens) {
-                .list => |list| list,
+            const page = switch (opens) {
+                .page => |page| page,
                 .update => {
                     update.checkForUpdate(update_policy);
                     return 1;
@@ -227,15 +287,12 @@ fn listHandler(action: c_int, x: c_int, y: c_int, idx: c_int, state: c_int) call
                     changeLanguage();
                     return 1;
                 },
+                .goal => {
+                    openGoalKeyboard();
+                    return 1;
+                },
             };
-            const opened = switch (list) {
-                .reading => pushScreen(.reading),
-                .finished => pushScreen(.finished),
-                .unread => pushScreen(.unread),
-                .activity => pushScreen(.activity),
-                .library => pushScreen(.library),
-            };
-            opened catch |err| {
+            pushScreen(page) catch |err| {
                 showError(t(.open_error), err);
                 return 1;
             };
@@ -270,11 +327,48 @@ fn paintRow(row: Row, x: c_int, y: c_int, selected: bool) void {
         pb.SetFont(title_font, pb.BLACK);
         _ = pb.DrawTextRect(x + padding, y + padding, text_width, line_height, row.title.ptr, flags);
         pb.SetFont(detail_font, pb.DGRAY);
-        _ = pb.DrawTextRect(x + padding, y + padding + line_height, text_width, line_height, row.detail.ptr, flags);
+        // A chart takes the right part of the second line
+        const detail_width = if (row.chart == .none) text_width else @divTrunc(text_width * 2, 5);
+        _ = pb.DrawTextRect(x + padding, y + padding + line_height, detail_width, line_height, row.detail.ptr, flags);
+        const chart_x = x + padding + detail_width + padding;
+        paintChart(row.chart, chart_x, y + padding + line_height, x + padding + text_width - chart_x, line_height);
     }
     pb.DrawLine(x, y + item_height - 1, x + width, y + item_height - 1, pb.LGRAY);
     if (selected and !row.heading) pb.DrawSelection(x, y, width, item_height, pb.BLACK);
 }
+
+fn paintChart(chart: Chart, x: c_int, y: c_int, width: c_int, height: c_int) void {
+    switch (chart) {
+        .none => {},
+        .bar => |bar| {
+            const h = @divTrunc(height, 2);
+            const top = y + @divTrunc(height - h, 2);
+            pb.DrawRect(x, top, width, h, pb.LGRAY);
+            if (bar.max == 0 or bar.value == 0) return;
+            const filled: c_int = @intCast(@max(1, @as(usize, @intCast(width)) * @min(bar.value, bar.max) / bar.max));
+            pb.FillArea(x, top, filled, h, pb.DGRAY);
+        },
+        .days => |mask| {
+            // The oldest day on the left, today on the right
+            const cell = @divTrunc(width, days_shown);
+            const size = @min(cell - 2, @divTrunc(height * 2, 3));
+            if (size <= 0) return;
+            const top = y + @divTrunc(height - size, 2);
+            for (0..days_shown) |i| {
+                const ago: u5 = @intCast(days_shown - 1 - i);
+                const left = x + @as(c_int, @intCast(i)) * cell;
+                if (mask & (@as(u32, 1) << ago) != 0) {
+                    pb.FillArea(left, top, size, size, pb.BLACK);
+                } else {
+                    pb.DrawRect(left, top, size, size, pb.LGRAY);
+                }
+            }
+        },
+    }
+}
+
+/// Days of the reading chart of the activity
+const days_shown = 30;
 
 fn z(allocator: std.mem.Allocator, text: []const u8) ![:0]const u8 {
     return allocator.dupeSentinel(u8, text, 0);
@@ -304,7 +398,7 @@ fn startRows(allocator: std.mem.Allocator) ![]const Row {
             try i18n.alloc(allocator, .reading_detail, .{ i18n.count(&count_buf, reading.len, .book), reading[0].title, lastRead(&ago_buf, reading[0]) })
         else
             t(.no_reading),
-        .opens = .{ .list = .reading },
+        .opens = .{ .page = .reading },
     });
 
     const finished = try stats.finishedPerMonth(allocator, books, utc_offset);
@@ -312,13 +406,35 @@ fn startRows(allocator: std.mem.Allocator) ![]const Row {
     try rows.append(allocator, .{
         .title = t(.finished),
         .detail = try i18n.alloc(allocator, .finished_detail, .{ i18n.count(&count_buf, summary.finished, .book), this_month }),
-        .opens = .{ .list = .finished },
+        .opens = .{ .page = .finished },
+    });
+
+    const year = dates.dateOf(today).year;
+    const this_year = try stats.yearSummary(allocator, books, year, utc_offset);
+    var goal_buf: [64]u8 = undefined;
+    var pace_buf: [48]u8 = undefined;
+    try rows.append(allocator, .{
+        .title = try z(allocator, i18n.fmt(&goal_buf, .goal, .{year})),
+        .detail = if (goal > 0)
+            try i18n.alloc(allocator, .goal_detail, .{ this_year.finished, goal, goalStatus(&pace_buf, this_year.finished) })
+        else
+            t(.goal_none),
+        .opens = .goal,
+        .chart = if (goal > 0) .{ .bar = .{ .value = this_year.finished, .max = goal } } else .none,
+    });
+
+    const reading_days = try journal.readingDaysIn(allocator, records, year, utc_offset);
+    var days_buf: [48]u8 = undefined;
+    try rows.append(allocator, .{
+        .title = try i18n.alloc(allocator, .year_title, .{year}),
+        .detail = try i18n.alloc(allocator, .year_detail, .{ i18n.count(&count_buf, this_year.finished, .book_finished), i18n.count(&days_buf, reading_days, .day) }),
+        .opens = .{ .page = .{ .year = year } },
     });
 
     try rows.append(allocator, .{
         .title = t(.unread),
         .detail = try z(allocator, i18n.count(&count_buf, summary.unread, .book)),
-        .opens = .{ .list = .unread },
+        .opens = .{ .page = .unread },
     });
 
     const activity = try journal.activity(allocator, records, today, utc_offset);
@@ -328,14 +444,14 @@ fn startRows(allocator: std.mem.Allocator) ![]const Row {
             try i18n.alloc(allocator, .activity_detail, .{ i18n.count(&count_buf, activity.days_last_30, .day), activity.streak })
         else
             t(.activity_empty),
-        .opens = .{ .list = .activity },
+        .opens = .{ .page = .activity },
     });
 
     const authors = try stats.authors(allocator, books);
     try rows.append(allocator, .{
         .title = t(.library),
         .detail = try i18n.alloc(allocator, .library_detail, .{ i18n.count(&count_buf, summary.books, .book), i18n.count(&other_buf, authors.len, .author) }),
-        .opens = .{ .list = .library },
+        .opens = .{ .page = .library },
     });
 
     if (update_policy != .off) {
@@ -361,6 +477,164 @@ fn startRows(allocator: std.mem.Allocator) ![]const Row {
     return rows.toOwnedSlice(allocator);
 }
 
+/// "2 ahead", "on track", "goal reached"
+fn goalStatus(buf: []u8, finished: usize) []const u8 {
+    if (finished >= goal) return t(.goal_reached);
+    const pace = stats.goalPace(finished, goal, today);
+    if (pace.ahead > 0) return i18n.fmt(buf, .goal_ahead, .{pace.ahead});
+    if (pace.ahead < 0) return i18n.fmt(buf, .goal_behind, .{-pace.ahead});
+    return t(.goal_on_track);
+}
+
+/// Where `book` is in `books`, for opening its sheet
+fn bookPage(book: library.Book) ?Action {
+    for (books, 0..) |other, i| {
+        if (other.id == book.id) return .{ .page = .{ .book = i } };
+    }
+    return null;
+}
+
+fn bookRows(allocator: std.mem.Allocator, book: library.Book) ![]const Row {
+    var rows: std.ArrayList(Row) = .empty;
+    var day_buf: [32]u8 = undefined;
+    var other_buf: [32]u8 = undefined;
+    var count_buf: [48]u8 = undefined;
+
+    if (book.author.len > 0) try rows.append(allocator, .{ .title = try z(allocator, book.author), .heading = true });
+
+    const progress = book.progress orelse library.Progress{};
+    const read = progress.permille();
+    var percent_buf: [8]u8 = undefined;
+    var pages_buf: [64]u8 = undefined;
+    const pages = if (progress.pages > 0) i18n.fmt(&pages_buf, .pages, .{ progress.page, progress.pages })[0..] else "";
+    try rows.append(allocator, .{
+        .title = t(.book_progress),
+        .detail = try std.fmt.allocPrintSentinel(allocator, "{s}{s}", .{ percent(&percent_buf, read), pages }, 0),
+        .chart = .{ .bar = .{ .value = read, .max = 1000 } },
+    });
+
+    const pace = journal.pace(records, book.id, today, utc_offset);
+    const finished_on = stats.finishedDay(book, utc_offset);
+    if (finished_on) |day| {
+        // The time it took is known when the journal saw the book from about its start
+        const started = if (pace) |p| (if (p.since_permille <= 50 and p.since <= day) p.since else null) else null;
+        try rows.append(allocator, .{
+            .title = t(.book_finished_on),
+            .detail = if (started) |since|
+                try i18n.alloc(allocator, .book_read_in, .{ dates.formatDay(&day_buf, day, today), i18n.count(&count_buf, @intCast(day - since + 1), .day) })
+            else
+                try z(allocator, dates.formatDay(&day_buf, day, today)),
+        });
+    }
+
+    if (pace) |p| {
+        try rows.append(allocator, .{
+            .title = t(.book_since),
+            .detail = try i18n.alloc(allocator, .book_since_detail, .{ dates.formatDay(&day_buf, p.since, today), percent(&percent_buf, p.since_permille) }),
+        });
+        if (finished_on == null) {
+            var rate_buf: [32]u8 = undefined;
+            const rate: ?[]const u8 = if (p.per_day <= 0)
+                null
+            else if (progress.pages > 0)
+                i18n.count(&rate_buf, @intFromFloat(@round(p.per_day * @as(f32, @floatFromInt(progress.pages)) / 1000)), .page)
+            else
+                std.fmt.bufPrint(&rate_buf, "{d:.1} %", .{p.per_day / 10}) catch null;
+            try rows.append(allocator, .{
+                .title = t(.book_pace),
+                .detail = if (rate) |r| try i18n.alloc(allocator, .book_pace_detail, .{r}) else t(.book_pace_none),
+            });
+            try rows.append(allocator, .{
+                .title = t(.book_finish),
+                .detail = if (p.finish) |finish|
+                    try i18n.alloc(allocator, .book_finish_detail, .{ dates.formatDay(&other_buf, finish, today), i18n.count(&count_buf, @intCast(@max(0, finish - today)), .day) })
+                else
+                    t(.book_finish_none),
+            });
+        }
+    }
+
+    var ago_buf: [32]u8 = undefined;
+    const last = lastRead(&ago_buf, book);
+    if (last.len > 0) try rows.append(allocator, .{ .title = t(.book_last), .detail = try z(allocator, last) });
+    if (book.added > 0) try rows.append(allocator, .{
+        .title = t(.book_added),
+        .detail = try z(allocator, dates.formatDay(&day_buf, dates.dayOf(book.added, utc_offset), today)),
+    });
+    return rows.toOwnedSlice(allocator);
+}
+
+fn yearRows(allocator: std.mem.Allocator, year: i32) ![]const Row {
+    var rows: std.ArrayList(Row) = .empty;
+    const summary = try stats.yearSummary(allocator, books, year, utc_offset);
+    var count_buf: [48]u8 = undefined;
+    var month_buf: [16]u8 = undefined;
+    const this_year = year == dates.dateOf(today).year;
+
+    try rows.append(allocator, .{
+        .title = t(.year_finished),
+        .detail = if (this_year and goal > 0)
+            try i18n.alloc(allocator, .year_finished_goal, .{ summary.finished, goal })
+        else
+            try z(allocator, i18n.count(&count_buf, summary.finished, .book)),
+        .chart = if (this_year and goal > 0) .{ .bar = .{ .value = summary.finished, .max = goal } } else .none,
+    });
+    if (summary.pages > 0) try rows.append(allocator, .{
+        .title = t(.year_pages),
+        .detail = try i18n.alloc(allocator, .year_pages_detail, .{summary.pages}),
+    });
+    const reading_days = try journal.readingDaysIn(allocator, records, year, utc_offset);
+    if (reading_days > 0) try rows.append(allocator, .{
+        .title = t(.year_days),
+        .detail = try z(allocator, i18n.count(&count_buf, reading_days, .day)),
+    });
+    if (summary.longest) |book| try rows.append(allocator, .{
+        .title = t(.year_longest),
+        .detail = try i18n.alloc(allocator, .year_longest_detail, .{ book.title, book.progress.?.pages }),
+        .opens = bookPage(book),
+    });
+    if (summary.top_author) |author| try rows.append(allocator, .{
+        .title = t(.year_author),
+        .detail = try std.fmt.allocPrintSentinel(allocator, "{s} · {s}", .{ author.name, i18n.count(&count_buf, author.count, .book) }, 0),
+    });
+
+    var best: usize = 0;
+    for (summary.per_month, 0..) |count, i| {
+        if (count > summary.per_month[best]) best = i;
+    }
+    const month_base = year * 12;
+    if (summary.finished > 0) {
+        try rows.append(allocator, .{
+            .title = t(.year_best_month),
+            .detail = try std.fmt.allocPrintSentinel(allocator, "{s} · {s}", .{
+                dates.formatMonth(&month_buf, month_base + @as(i32, @intCast(best))),
+                i18n.count(&count_buf, summary.per_month[best], .book_finished),
+            }, 0),
+        });
+        // The months up to now, as bars
+        const last_month: usize = if (this_year) dates.dateOf(today).month else 12;
+        try rows.append(allocator, .{ .title = t(.year_per_month), .heading = true });
+        for (0..last_month) |i| try rows.append(allocator, .{
+            .title = try z(allocator, dates.formatMonth(&month_buf, month_base + @as(i32, @intCast(i)))),
+            .detail = try z(allocator, i18n.count(&count_buf, summary.per_month[i], .book)),
+            .chart = .{ .bar = .{ .value = summary.per_month[i], .max = summary.per_month[best] } },
+        });
+    }
+
+    const years = try stats.finishedYears(allocator, books, utc_offset);
+    var others: usize = 0;
+    for (years) |other| {
+        if (other == year) continue;
+        if (others == 0) try rows.append(allocator, .{ .title = t(.other_years), .heading = true });
+        others += 1;
+        try rows.append(allocator, .{
+            .title = try i18n.alloc(allocator, .year_title, .{other}),
+            .opens = .{ .page = .{ .year = other } },
+        });
+    }
+    return rows.toOwnedSlice(allocator);
+}
+
 fn lastRead(buf: []u8, book: library.Book) []const u8 {
     const progress = book.progress orelse return "";
     const last = @max(progress.opened, progress.moved);
@@ -380,6 +654,7 @@ fn readingRows(allocator: std.mem.Allocator) ![]const Row {
         row.* = .{
             .title = try z(allocator, book.title),
             .detail = try i18n.alloc(allocator, .reading_row, .{ percent(&percent_buf, progress.permille()), lastRead(&ago_buf, book), pages }),
+            .opens = bookPage(book),
         };
     }
     return rows;
@@ -397,6 +672,7 @@ fn finishedRows(allocator: std.mem.Allocator) ![]const Row {
                 try i18n.alloc(allocator, .finished_row, .{ dates.formatDay(&day_buf, dates.dayOf(progress.completed_at, utc_offset), today), book.author })
             else
                 try i18n.alloc(allocator, .finished_row_unknown, .{book.author}),
+            .opens = bookPage(book),
         };
     }
     return rows;
@@ -425,6 +701,7 @@ fn activityRows(allocator: std.mem.Allocator) ![]const Row {
     try rows.append(allocator, .{
         .title = try i18n.alloc(allocator, .days_30, .{i18n.count(&count_buf, activity.days_last_30, .day)}),
         .detail = try i18n.alloc(allocator, .streak, .{i18n.count(&count_buf, activity.streak, .day)}),
+        .chart = .{ .days = journal.recentDays(records, today, utc_offset, days_shown) },
     });
     try rows.append(allocator, .{
         .title = t(.how),
@@ -454,6 +731,12 @@ fn activityRows(allocator: std.mem.Allocator) ![]const Row {
     return rows.toOwnedSlice(allocator);
 }
 
+fn maxCount(months: []const stats.MonthCount) usize {
+    var max: usize = 0;
+    for (months) |entry| max = @max(max, entry.count);
+    return max;
+}
+
 fn libraryRows(allocator: std.mem.Allocator) ![]const Row {
     var rows: std.ArrayList(Row) = .empty;
     const summary = stats.summarize(books);
@@ -470,6 +753,7 @@ fn libraryRows(allocator: std.mem.Allocator) ![]const Row {
     for (finished) |entry| try rows.append(allocator, .{
         .title = try z(allocator, dates.formatMonth(&month_buf, entry.month)),
         .detail = try z(allocator, i18n.count(&count_buf, entry.count, .book_finished)),
+        .chart = .{ .bar = .{ .value = entry.count, .max = maxCount(finished) } },
     });
 
     const authors = try stats.authors(allocator, books);
@@ -491,6 +775,7 @@ fn libraryRows(allocator: std.mem.Allocator) ![]const Row {
     for (added) |entry| try rows.append(allocator, .{
         .title = try z(allocator, dates.formatMonth(&month_buf, entry.month)),
         .detail = try z(allocator, i18n.count(&count_buf, entry.count, .book_added)),
+        .chart = .{ .bar = .{ .value = entry.count, .max = maxCount(added) } },
     });
 
     const formats = try stats.formats(allocator, books);
