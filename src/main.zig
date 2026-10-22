@@ -9,11 +9,11 @@ const stats = @import("stats.zig");
 const dates = @import("dates.zig");
 const update = @import("update.zig");
 const Policy = @import("update_check.zig").Policy;
+const i18n = @import("i18n.zig");
 const pocketbook = @import("pocketbook.zig");
 const trace = pocketbook.trace;
 const showError = pocketbook.showError;
-
-const app_title = @import("build_options").app_name;
+const t = i18n.t;
 
 /// A line of a list: a title, and a second, grey line under it
 const Row = struct {
@@ -27,8 +27,8 @@ const Row = struct {
 
 const List = enum { reading, finished, unread, activity, library };
 
-/// What opening a row does: open a list, or look for an update
-const Action = union(enum) { list: List, update };
+/// What opening a row does: open a list, look for an update, or change the language
+const Action = union(enum) { list: List, update, language };
 
 /// A list on screen. Opening a row pushes one, Back pops it
 const Screen = struct {
@@ -55,8 +55,46 @@ var title_font: ?*pb.ifont = null;
 var detail_font: ?*pb.ifont = null;
 var heading_font: ?*pb.ifont = null;
 
-/// The app's settings: "updates=all" (default), "stable" (no nightly builds) or "off"
+/// The app's settings: "updates=stable" (default), "all" (nightly builds too) or "off";
+/// "language=auto" (default, the reader's), "fr" or "en"
 const config_path = "/mnt/ext1/system/config/reading-stats.cfg";
+
+var language: i18n.Choice = .auto;
+
+extern "c" fn currentLang() ?[*:0]const u8;
+
+fn readLanguage() i18n.Choice {
+    const config = pb.OpenConfig(config_path, null) orelse return .auto;
+    defer pb.CloseConfigNoSave(config);
+    return i18n.Choice.parse(std.mem.span(pb.ReadString(config, "language", "auto")));
+}
+
+fn applyLanguage() void {
+    i18n.lang = language.resolve(std.mem.span(currentLang() orelse "en"));
+    _ = pb.SetSubtaskInfo(pb.GetCurrentTask(), 0, t(.app_title), null);
+}
+
+/// Goes to the next language, keeps it and shows the start screen in it
+fn changeLanguage() void {
+    language = language.next();
+    if (pb.OpenConfig(config_path, null)) |config| {
+        pb.WriteString(config, "language", @tagName(language));
+        _ = pb.SaveConfig(config);
+        pb.CloseConfig(config);
+    }
+    applyLanguage();
+    // The start screen is the only one open: built again in the new language
+    while (screens.pop()) |screen| {
+        var closed = screen;
+        closed.arena.deinit();
+    }
+    pushScreen(.start) catch {
+        pb.CloseApp();
+        return;
+    };
+    screens.items[0].pos = startRowCount() - 1;
+    showList();
+}
 
 /// Which updates the start screen offers
 var update_policy: Policy = .off;
@@ -107,7 +145,8 @@ fn loadData() !void {
 fn mainHandler(event_type: c_int, par1: c_int, _: c_int) callconv(.c) c_int {
     switch (event_type) {
         pb.EVT_INIT => {
-            _ = pb.SetSubtaskInfo(pb.GetCurrentTask(), 0, app_title, null);
+            language = readLanguage();
+            applyLanguage();
 
             item_height = @divTrunc(pb.ScreenHeight(), 10);
             padding = @divTrunc(item_height, 8);
@@ -117,11 +156,11 @@ fn mainHandler(event_type: c_int, par1: c_int, _: c_int) callconv(.c) c_int {
 
             update_policy = readUpdatePolicy();
             loadData() catch |err| {
-                showError("Could not read the library", err);
+                showError(t(.read_error), err);
                 pb.CloseApp();
                 return 0;
             };
-            pushScreen(app_title, startRows) catch {
+            pushScreen(.start) catch {
                 pb.CloseApp();
                 return 0;
             };
@@ -142,12 +181,20 @@ fn mainHandler(event_type: c_int, par1: c_int, _: c_int) callconv(.c) c_int {
     return 0;
 }
 
-const RowsFn = fn (std.mem.Allocator) anyerror![]const Row;
+const Page = enum { start, reading, finished, unread, activity, library };
 
-fn pushScreen(title: [:0]const u8, comptime rows: RowsFn) !void {
+fn pushScreen(page: Page) !void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     errdefer arena.deinit();
-    const list = try rows(arena.allocator());
+    const allocator = arena.allocator();
+    const title, const list = switch (page) {
+        .start => .{ t(.app_title), try startRows(allocator) },
+        .reading => .{ t(.reading), try readingRows(allocator) },
+        .finished => .{ t(.finished), try finishedRows(allocator) },
+        .unread => .{ t(.unread), try unreadRows(allocator) },
+        .activity => .{ t(.activity), try activityRows(allocator) },
+        .library => .{ t(.library), try libraryRows(allocator) },
+    };
     try screens.append(gpa, .{ .arena = arena, .title = title, .rows = list });
 }
 
@@ -176,16 +223,20 @@ fn listHandler(action: c_int, x: c_int, y: c_int, idx: c_int, state: c_int) call
                     update.checkForUpdate(update_policy);
                     return 1;
                 },
+                .language => {
+                    changeLanguage();
+                    return 1;
+                },
             };
             const opened = switch (list) {
-                .reading => pushScreen("Reading", readingRows),
-                .finished => pushScreen("Finished", finishedRows),
-                .unread => pushScreen("Not started", unreadRows),
-                .activity => pushScreen("Activity", activityRows),
-                .library => pushScreen("Library", libraryRows),
+                .reading => pushScreen(.reading),
+                .finished => pushScreen(.finished),
+                .unread => pushScreen(.unread),
+                .activity => pushScreen(.activity),
+                .library => pushScreen(.library),
             };
             opened catch |err| {
-                showError("Could not open the list", err);
+                showError(t(.open_error), err);
                 return 1;
             };
             showList();
@@ -225,16 +276,8 @@ fn paintRow(row: Row, x: c_int, y: c_int, selected: bool) void {
     if (selected and !row.heading) pb.DrawSelection(x, y, width, item_height, pb.BLACK);
 }
 
-fn print(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]const u8 {
-    return std.fmt.allocPrintSentinel(allocator, fmt, args, 0);
-}
-
 fn z(allocator: std.mem.Allocator, text: []const u8) ![:0]const u8 {
     return allocator.dupeSentinel(u8, text, 0);
-}
-
-fn plural(count: usize, comptime one: []const u8, comptime many: []const u8) []const u8 {
-    return if (count == 1) one else many;
 }
 
 /// "41 %"
@@ -242,60 +285,79 @@ fn percent(buf: []u8, permille: u16) []const u8 {
     return std.fmt.bufPrint(buf, "{d} %", .{permille / 10}) catch "";
 }
 
+/// The rows of the start screen; the last one sets the language
+fn startRowCount() c_int {
+    return @intCast(screens.items[0].rows.len);
+}
+
 fn startRows(allocator: std.mem.Allocator) ![]const Row {
     const summary = stats.summarize(books);
     var rows: std.ArrayList(Row) = .empty;
+    var count_buf: [48]u8 = undefined;
+    var other_buf: [48]u8 = undefined;
 
     const reading = try stats.shelf(allocator, books, .reading);
     var ago_buf: [32]u8 = undefined;
     try rows.append(allocator, .{
-        .title = "Reading",
+        .title = t(.reading),
         .detail = if (reading.len > 0)
-            try print(allocator, "{d} {s} · last: {s}, {s}", .{ reading.len, plural(reading.len, "book", "books"), reading[0].title, lastRead(&ago_buf, reading[0]) })
+            try i18n.alloc(allocator, .reading_detail, .{ i18n.count(&count_buf, reading.len, .book), reading[0].title, lastRead(&ago_buf, reading[0]) })
         else
-            "No book being read",
+            t(.no_reading),
         .opens = .{ .list = .reading },
     });
 
     const finished = try stats.finishedPerMonth(allocator, books, utc_offset);
     const this_month: usize = if (finished.len > 0 and finished[0].month == dates.monthOf(today)) finished[0].count else 0;
     try rows.append(allocator, .{
-        .title = "Finished",
-        .detail = try print(allocator, "{d} {s} · {d} this month", .{ summary.finished, plural(summary.finished, "book", "books"), this_month }),
+        .title = t(.finished),
+        .detail = try i18n.alloc(allocator, .finished_detail, .{ i18n.count(&count_buf, summary.finished, .book), this_month }),
         .opens = .{ .list = .finished },
     });
 
     try rows.append(allocator, .{
-        .title = "Not started",
-        .detail = try print(allocator, "{d} {s}", .{ summary.unread, plural(summary.unread, "book", "books") }),
+        .title = t(.unread),
+        .detail = try z(allocator, i18n.count(&count_buf, summary.unread, .book)),
         .opens = .{ .list = .unread },
     });
 
     const activity = try journal.activity(allocator, records, today, utc_offset);
     try rows.append(allocator, .{
-        .title = "Activity",
+        .title = t(.activity),
         .detail = if (activity.days > 0)
-            try print(allocator, "{d} reading {s} in the last 30 days · streak: {d}", .{ activity.days_last_30, plural(activity.days_last_30, "day", "days"), activity.streak })
+            try i18n.alloc(allocator, .activity_detail, .{ i18n.count(&count_buf, activity.days_last_30, .day), activity.streak })
         else
-            "Recorded from now on, each time you open this app",
+            t(.activity_empty),
         .opens = .{ .list = .activity },
     });
 
     const authors = try stats.authors(allocator, books);
     try rows.append(allocator, .{
-        .title = "Library",
-        .detail = try print(allocator, "{d} {s} · {d} {s}", .{ summary.books, plural(summary.books, "book", "books"), authors.len, plural(authors.len, "author", "authors") }),
+        .title = t(.library),
+        .detail = try i18n.alloc(allocator, .library_detail, .{ i18n.count(&count_buf, summary.books, .book), i18n.count(&other_buf, authors.len, .author) }),
         .opens = .{ .list = .library },
     });
 
     if (update_policy != .off) {
         var buf: [128]u8 = undefined;
         try rows.append(allocator, .{
-            .title = "Check for updates",
+            .title = t(.check_updates),
             .detail = try z(allocator, update.describeInstalled(&buf)),
             .opens = .update,
         });
     }
+
+    var language_buf: [96]u8 = undefined;
+    const chosen = switch (language) {
+        .auto => t(.language_auto),
+        .fr => t(.language_fr),
+        .en => t(.language_en),
+    };
+    try rows.append(allocator, .{
+        .title = try z(allocator, i18n.fmt(&language_buf, .language, .{chosen})),
+        .detail = t(.language_change),
+        .opens = .language,
+    });
     return rows.toOwnedSlice(allocator);
 }
 
@@ -313,13 +375,11 @@ fn readingRows(allocator: std.mem.Allocator) ![]const Row {
         const progress = book.progress.?;
         var percent_buf: [8]u8 = undefined;
         var ago_buf: [32]u8 = undefined;
-        const pages = if (progress.pages > 0)
-            try print(allocator, " · page {d} of {d}", .{ progress.page, progress.pages })
-        else
-            "";
+        var pages_buf: [64]u8 = undefined;
+        const pages = if (progress.pages > 0) i18n.fmt(&pages_buf, .pages, .{ progress.page, progress.pages })[0..] else "";
         row.* = .{
             .title = try z(allocator, book.title),
-            .detail = try print(allocator, "{s} · read {s}{s}", .{ percent(&percent_buf, progress.permille()), lastRead(&ago_buf, book), pages }),
+            .detail = try i18n.alloc(allocator, .reading_row, .{ percent(&percent_buf, progress.permille()), lastRead(&ago_buf, book), pages }),
         };
     }
     return rows;
@@ -330,11 +390,13 @@ fn finishedRows(allocator: std.mem.Allocator) ![]const Row {
     const rows = try allocator.alloc(Row, list.len);
     for (list, rows) |book, *row| {
         const progress = book.progress.?;
-        var day_buf: [24]u8 = undefined;
-        const when = if (progress.completed_at > 0) dates.formatDay(&day_buf, dates.dayOf(progress.completed_at, utc_offset), today) else "date unknown";
+        var day_buf: [32]u8 = undefined;
         row.* = .{
             .title = try z(allocator, book.title),
-            .detail = try print(allocator, "Finished {s} · {s}", .{ when, book.author }),
+            .detail = if (progress.completed_at > 0)
+                try i18n.alloc(allocator, .finished_row, .{ dates.formatDay(&day_buf, dates.dayOf(progress.completed_at, utc_offset), today), book.author })
+            else
+                try i18n.alloc(allocator, .finished_row_unknown, .{book.author}),
         };
     }
     return rows;
@@ -344,11 +406,11 @@ fn unreadRows(allocator: std.mem.Allocator) ![]const Row {
     const list = try stats.shelf(allocator, books, .unread);
     const rows = try allocator.alloc(Row, list.len);
     for (list, rows) |book, *row| {
-        var day_buf: [24]u8 = undefined;
+        var day_buf: [32]u8 = undefined;
         const added = if (book.added > 0) dates.formatDay(&day_buf, dates.dayOf(book.added, utc_offset), today) else "?";
         row.* = .{
             .title = try z(allocator, book.title),
-            .detail = try print(allocator, "{s} · added {s}{s}", .{ book.author, added, if (book.on_device) "" else " · in the cloud" }),
+            .detail = try i18n.alloc(allocator, .unread_row, .{ book.author, added, if (book.on_device) "" else t(.in_cloud) }),
         };
     }
     return rows;
@@ -357,22 +419,23 @@ fn unreadRows(allocator: std.mem.Allocator) ![]const Row {
 fn activityRows(allocator: std.mem.Allocator) ![]const Row {
     var rows: std.ArrayList(Row) = .empty;
     const activity = try journal.activity(allocator, records, today, utc_offset);
-    var day_buf: [24]u8 = undefined;
+    var day_buf: [32]u8 = undefined;
+    var count_buf: [48]u8 = undefined;
 
     try rows.append(allocator, .{
-        .title = try print(allocator, "{d} reading {s} in the last 30 days", .{ activity.days_last_30, plural(activity.days_last_30, "day", "days") }),
-        .detail = try print(allocator, "Current streak: {d} {s}", .{ activity.streak, plural(activity.streak, "day", "days") }),
+        .title = try i18n.alloc(allocator, .days_30, .{i18n.count(&count_buf, activity.days_last_30, .day)}),
+        .detail = try i18n.alloc(allocator, .streak, .{i18n.count(&count_buf, activity.streak, .day)}),
     });
     try rows.append(allocator, .{
-        .title = "How this works",
+        .title = t(.how),
         .detail = if (activity.since) |since|
-            try print(allocator, "Progress noted each time this app opens, since {s}", .{dates.formatDay(&day_buf, since, today)})
+            try i18n.alloc(allocator, .how_since, .{dates.formatDay(&day_buf, since, today)})
         else
-            "Progress is noted each time this app opens",
+            t(.how_plain),
     });
 
     const list = try journal.steps(allocator, records);
-    if (list.len > 0) try rows.append(allocator, .{ .title = "Recent progress", .heading = true });
+    if (list.len > 0) try rows.append(allocator, .{ .title = t(.recent), .heading = true });
     for (list) |step| {
         var from_buf: [8]u8 = undefined;
         var to_buf: [8]u8 = undefined;
@@ -381,11 +444,11 @@ fn activityRows(allocator: std.mem.Allocator) ![]const Row {
         try rows.append(allocator, .{
             .title = try z(allocator, step.record.title),
             .detail = if (step.record.permille == 1000)
-                try print(allocator, "{s} · finished", .{day})
+                try i18n.alloc(allocator, .step_finished, .{day})
             else if (step.from) |from|
-                try print(allocator, "{s} · {s} → {s}", .{ day, percent(&from_buf, from), to })
+                try i18n.alloc(allocator, .step_from, .{ day, percent(&from_buf, from), to })
             else
-                try print(allocator, "{s} · at {s}", .{ day, to }),
+                try i18n.alloc(allocator, .step_at, .{ day, to }),
         });
     }
     return rows.toOwnedSlice(allocator);
@@ -395,48 +458,49 @@ fn libraryRows(allocator: std.mem.Allocator) ![]const Row {
     var rows: std.ArrayList(Row) = .empty;
     const summary = stats.summarize(books);
     var month_buf: [16]u8 = undefined;
+    var count_buf: [48]u8 = undefined;
 
     try rows.append(allocator, .{
-        .title = try print(allocator, "{d} {s}", .{ summary.books, plural(summary.books, "book", "books") }),
-        .detail = try print(allocator, "{d} on the reader, {d} only in the cloud", .{ summary.on_device, summary.books - summary.on_device }),
+        .title = try z(allocator, i18n.count(&count_buf, summary.books, .book)),
+        .detail = try i18n.alloc(allocator, .on_reader, .{ summary.on_device, summary.books - summary.on_device }),
     });
 
     const finished = try stats.finishedPerMonth(allocator, books, utc_offset);
-    if (finished.len > 0) try rows.append(allocator, .{ .title = "Finished per month", .heading = true });
+    if (finished.len > 0) try rows.append(allocator, .{ .title = t(.finished_per_month), .heading = true });
     for (finished) |entry| try rows.append(allocator, .{
         .title = try z(allocator, dates.formatMonth(&month_buf, entry.month)),
-        .detail = try print(allocator, "{d} {s} finished", .{ entry.count, plural(entry.count, "book", "books") }),
+        .detail = try z(allocator, i18n.count(&count_buf, entry.count, .book_finished)),
     });
 
     const authors = try stats.authors(allocator, books);
-    if (authors.len > 0) try rows.append(allocator, .{ .title = "Authors", .heading = true });
+    if (authors.len > 0) try rows.append(allocator, .{ .title = t(.authors), .heading = true });
     for (authors[0..@min(authors.len, 20)]) |entry| try rows.append(allocator, .{
         .title = try z(allocator, entry.name),
-        .detail = try print(allocator, "{d} {s}", .{ entry.count, plural(entry.count, "book", "books") }),
+        .detail = try z(allocator, i18n.count(&count_buf, entry.count, .book)),
     });
 
     const series = try stats.series(allocator, books);
-    if (series.len > 0) try rows.append(allocator, .{ .title = "Series", .heading = true });
+    if (series.len > 0) try rows.append(allocator, .{ .title = t(.series), .heading = true });
     for (series) |entry| try rows.append(allocator, .{
         .title = try z(allocator, entry.name),
-        .detail = try print(allocator, "{d} {s}", .{ entry.count, plural(entry.count, "book", "books") }),
+        .detail = try z(allocator, i18n.count(&count_buf, entry.count, .book)),
     });
 
     const added = try stats.addedPerMonth(allocator, books, utc_offset);
-    if (added.len > 0) try rows.append(allocator, .{ .title = "Added per month", .heading = true });
+    if (added.len > 0) try rows.append(allocator, .{ .title = t(.added_per_month), .heading = true });
     for (added) |entry| try rows.append(allocator, .{
         .title = try z(allocator, dates.formatMonth(&month_buf, entry.month)),
-        .detail = try print(allocator, "{d} {s} added", .{ entry.count, plural(entry.count, "book", "books") }),
+        .detail = try z(allocator, i18n.count(&count_buf, entry.count, .book_added)),
     });
 
     const formats = try stats.formats(allocator, books);
-    if (formats.len > 0) try rows.append(allocator, .{ .title = "Formats", .heading = true });
+    if (formats.len > 0) try rows.append(allocator, .{ .title = t(.formats), .heading = true });
     for (formats) |entry| {
         var upper: [16]u8 = undefined;
         const name = entry.name[0..@min(entry.name.len, upper.len)];
         try rows.append(allocator, .{
             .title = try z(allocator, std.ascii.upperString(upper[0..name.len], name)),
-            .detail = try print(allocator, "{d} {s}", .{ entry.count, plural(entry.count, "book", "books") }),
+            .detail = try z(allocator, i18n.count(&count_buf, entry.count, .book)),
         });
     }
     return rows.toOwnedSlice(allocator);

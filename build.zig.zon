@@ -1,6 +1,6 @@
 .{
     .name = .pb_stats,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0xb9e639a0dc9adcf6,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

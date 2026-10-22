@@ -44,6 +44,12 @@ checksum does not match. After creating or editing the file, add or fix that lin
 `fix-config-checksum.py` from
 [pb-opds-connector](https://github.com/Aluriak/pb-opds-connector/blob/main/scripts/fix-config-checksum.py).
 
+## Language
+
+The app speaks English or French. By default it follows the reader's language; the last row of
+the start screen switches between the reader's language, French and English. The choice is kept
+in `system/config/reading-stats.cfg` as `language=auto`, `fr` or `en`.
+
 ## How it works
 
 The library of the reader lives in a SQLite database,

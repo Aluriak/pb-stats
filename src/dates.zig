@@ -2,6 +2,7 @@
 //! The time zone is a fixed offset, taken once when the app starts.
 
 const std = @import("std");
+const i18n = @import("i18n.zig");
 
 /// A day, counted from 1970-01-01 in local time
 pub const Day = i32;
@@ -42,32 +43,59 @@ pub fn monthOf(day: Day) Month {
 }
 
 const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+const month_names_fr = [_][]const u8{ "janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc." };
 
-/// "Oct 2026"
+fn monthName(index: usize) []const u8 {
+    return switch (i18n.lang) {
+        .en => month_names[index],
+        .fr => month_names_fr[index],
+    };
+}
+
+/// "Oct 2026", "oct. 2026"
 pub fn formatMonth(buf: []u8, month: Month) []const u8 {
     const year = @divFloor(month, 12);
     const index: usize = @intCast(@mod(month, 12));
-    return std.fmt.bufPrint(buf, "{s} {d}", .{ month_names[index], year }) catch "";
+    return std.fmt.bufPrint(buf, "{s} {d}", .{ monthName(index), year }) catch "";
 }
 
-/// "Oct 22", or "Oct 22, 2025" when not in the year of `today`
+/// "Oct 22" ("22 oct."), with the year when not that of `today`
 pub fn formatDay(buf: []u8, day: Day, today: Day) []const u8 {
     const date = dateOf(day);
-    const name = month_names[date.month - 1];
-    const text = if (date.year == dateOf(today).year)
-        std.fmt.bufPrint(buf, "{s} {d}", .{ name, date.day })
-    else
-        std.fmt.bufPrint(buf, "{s} {d}, {d}", .{ name, date.day, date.year });
+    const name = monthName(date.month - 1);
+    const same_year = date.year == dateOf(today).year;
+    const text = switch (i18n.lang) {
+        .en => if (same_year)
+            std.fmt.bufPrint(buf, "{s} {d}", .{ name, date.day })
+        else
+            std.fmt.bufPrint(buf, "{s} {d}, {d}", .{ name, date.day, date.year }),
+        .fr => if (same_year)
+            std.fmt.bufPrint(buf, "{d} {s}", .{ date.day, name })
+        else
+            std.fmt.bufPrint(buf, "{d} {s} {d}", .{ date.day, name, date.year }),
+    };
     return text catch "";
 }
 
-/// "today", "yesterday", "3 days ago", then the date
+/// "today", "yesterday", "3 days ago", then the date ("aujourd'hui", "hier", "il y a 3 jours",
+/// "le 8 oct.")
 pub fn formatAgo(buf: []u8, day: Day, today: Day) []const u8 {
     const days = today - day;
-    if (days <= 0) return "today";
-    if (days == 1) return "yesterday";
-    if (days < 7) return std.fmt.bufPrint(buf, "{d} days ago", .{days}) catch "";
-    return formatDay(buf, day, today);
+    switch (i18n.lang) {
+        .en => {
+            if (days <= 0) return "today";
+            if (days == 1) return "yesterday";
+            if (days < 7) return std.fmt.bufPrint(buf, "{d} days ago", .{days}) catch "";
+            return formatDay(buf, day, today);
+        },
+        .fr => {
+            if (days <= 0) return "aujourd'hui";
+            if (days == 1) return "hier";
+            if (days < 7) return std.fmt.bufPrint(buf, "il y a {d} jours", .{days}) catch "";
+            var day_buf: [32]u8 = undefined;
+            return std.fmt.bufPrint(buf, "le {s}", .{formatDay(&day_buf, day, today)}) catch "";
+        },
+    }
 }
 
 test "dateOf and dayOf agree with known dates" {
@@ -101,4 +129,16 @@ test "formatAgo speaks of recent days, then gives the date" {
     try std.testing.expectEqualStrings("3 days ago", formatAgo(&buf, today - 3, today));
     try std.testing.expectEqualStrings("Oct 8", formatAgo(&buf, today - 14, today));
     try std.testing.expectEqualStrings("Oct 22, 2025", formatAgo(&buf, today - 365, today));
+}
+
+test "dates in French" {
+    i18n.lang = .fr;
+    defer i18n.lang = .en;
+    var buf: [32]u8 = undefined;
+    const today = dayOf(1792628940, 0);
+    try std.testing.expectEqualStrings("oct. 2026", formatMonth(&buf, monthOf(today)));
+    try std.testing.expectEqualStrings("hier", formatAgo(&buf, today - 1, today));
+    try std.testing.expectEqualStrings("il y a 3 jours", formatAgo(&buf, today - 3, today));
+    try std.testing.expectEqualStrings("le 8 oct.", formatAgo(&buf, today - 14, today));
+    try std.testing.expectEqualStrings("22 oct. 2025", formatDay(&buf, today - 365, today));
 }

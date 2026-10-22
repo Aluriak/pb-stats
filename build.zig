@@ -84,7 +84,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test` runs the unit tests on the build machine, for the files that need
     // nothing from the reader. SQLite is built for the build machine for them.
     const test_step = b.step("test", "Run the unit tests");
-    for ([_][]const u8{ "src/library.zig", "src/dates.zig", "src/stats.zig", "src/journal.zig", "src/update_check.zig", "src/failure.zig" }) |file| {
+    for ([_][]const u8{ "src/library.zig", "src/dates.zig", "src/stats.zig", "src/journal.zig", "src/update_check.zig", "src/failure.zig", "src/i18n.zig" }) |file| {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(file),
