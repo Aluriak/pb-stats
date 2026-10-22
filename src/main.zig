@@ -1,13 +1,17 @@
 //! Reading Stats: what the reader's library knows about your reading, on the reader.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const pb = @import("c");
 
 const library = @import("library.zig");
 const journal = @import("journal.zig");
 const stats = @import("stats.zig");
 const dates = @import("dates.zig");
+const update = @import("update.zig");
+const Policy = @import("update_check.zig").Policy;
+const pocketbook = @import("pocketbook.zig");
+const trace = pocketbook.trace;
+const showError = pocketbook.showError;
 
 const app_title = @import("build_options").app_name;
 
@@ -15,13 +19,16 @@ const app_title = @import("build_options").app_name;
 const Row = struct {
     title: [:0]const u8,
     detail: [:0]const u8 = "",
-    /// The list it opens, if any
-    opens: ?List = null,
+    /// What opening it does, if anything
+    opens: ?Action = null,
     /// A heading between parts of a list, not a book
     heading: bool = false,
 };
 
 const List = enum { reading, finished, unread, activity, library };
+
+/// What opening a row does: open a list, or look for an update
+const Action = union(enum) { list: List, update };
 
 /// A list on screen. Opening a row pushes one, Back pops it
 const Screen = struct {
@@ -48,19 +55,17 @@ var title_font: ?*pb.ifont = null;
 var detail_font: ?*pb.ifont = null;
 var heading_font: ?*pb.ifont = null;
 
-/// Writes to the log of debug builds, release builds stay silent.
-/// Zig's own I/O layer makes system calls the reader's 3.10 kernel lacks, so through libc.
-fn trace(comptime fmt: []const u8, args: anytype) void {
-    if (builtin.mode != .debug) return;
-    var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = std.c.write(2, msg.ptr, msg.len);
-}
+/// The app's settings: "updates=all" (default), "stable" (no nightly builds) or "off"
+const config_path = "/mnt/ext1/system/config/reading-stats.cfg";
 
-fn showError(text: []const u8, err: anyerror) void {
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrintSentinel(&buf, "{s}:\n{s}", .{ text, @errorName(err) }, 0) catch "Error";
-    pb.Message(pb.ICON_ERROR, app_title, msg.ptr, 10000);
+/// Which updates the start screen offers
+var update_policy: Policy = .off;
+
+fn readUpdatePolicy() Policy {
+    if (!update.enabled) return .off;
+    const config = pb.OpenConfig(config_path, null) orelse return .all;
+    defer pb.CloseConfigNoSave(config);
+    return Policy.parse(std.mem.span(pb.ReadString(config, "updates", "all")));
 }
 
 const Tm = extern struct {
@@ -110,6 +115,7 @@ fn mainHandler(event_type: c_int, par1: c_int, _: c_int) callconv(.c) c_int {
             detail_font = pb.OpenFont(pb.iv_get_default_font(pb.FONT_STD), @divTrunc(item_height, 5), 1);
             heading_font = pb.OpenFont(pb.iv_get_default_font(pb.FONT_BOLD), @divTrunc(item_height, 5), 1);
 
+            update_policy = readUpdatePolicy();
             loadData() catch |err| {
                 showError("Could not read the library", err);
                 pb.CloseApp();
@@ -163,7 +169,14 @@ fn listHandler(action: c_int, x: c_int, y: c_int, idx: c_int, state: c_int) call
             if (idx < 0 or idx >= screen.rows.len) return 0;
             screen.pos = idx;
             const row = screen.rows[@intCast(idx)];
-            const list = row.opens orelse return 1;
+            const opens = row.opens orelse return 1;
+            const list = switch (opens) {
+                .list => |list| list,
+                .update => {
+                    update.checkForUpdate(update_policy);
+                    return 1;
+                },
+            };
             const opened = switch (list) {
                 .reading => pushScreen("Reading", readingRows),
                 .finished => pushScreen("Finished", finishedRows),
@@ -241,7 +254,7 @@ fn startRows(allocator: std.mem.Allocator) ![]const Row {
             try print(allocator, "{d} {s} · last: {s}, {s}", .{ reading.len, plural(reading.len, "book", "books"), reading[0].title, lastRead(&ago_buf, reading[0]) })
         else
             "No book being read",
-        .opens = .reading,
+        .opens = .{ .list = .reading },
     });
 
     const finished = try stats.finishedPerMonth(allocator, books, utc_offset);
@@ -249,13 +262,13 @@ fn startRows(allocator: std.mem.Allocator) ![]const Row {
     try rows.append(allocator, .{
         .title = "Finished",
         .detail = try print(allocator, "{d} {s} · {d} this month", .{ summary.finished, plural(summary.finished, "book", "books"), this_month }),
-        .opens = .finished,
+        .opens = .{ .list = .finished },
     });
 
     try rows.append(allocator, .{
         .title = "Not started",
         .detail = try print(allocator, "{d} {s}", .{ summary.unread, plural(summary.unread, "book", "books") }),
-        .opens = .unread,
+        .opens = .{ .list = .unread },
     });
 
     const activity = try journal.activity(allocator, records, today, utc_offset);
@@ -265,15 +278,24 @@ fn startRows(allocator: std.mem.Allocator) ![]const Row {
             try print(allocator, "{d} reading {s} in the last 30 days · streak: {d}", .{ activity.days_last_30, plural(activity.days_last_30, "day", "days"), activity.streak })
         else
             "Recorded from now on, each time you open this app",
-        .opens = .activity,
+        .opens = .{ .list = .activity },
     });
 
     const authors = try stats.authors(allocator, books);
     try rows.append(allocator, .{
         .title = "Library",
         .detail = try print(allocator, "{d} {s} · {d} {s}", .{ summary.books, plural(summary.books, "book", "books"), authors.len, plural(authors.len, "author", "authors") }),
-        .opens = .library,
+        .opens = .{ .list = .library },
     });
+
+    if (update_policy != .off) {
+        var buf: [128]u8 = undefined;
+        try rows.append(allocator, .{
+            .title = "Check for updates",
+            .detail = try z(allocator, update.describeInstalled(&buf)),
+            .opens = .update,
+        });
+    }
     return rows.toOwnedSlice(allocator);
 }
 

@@ -12,6 +12,7 @@ the reader's library and shows:
   book over time.
 * **Library:** books on the reader and in the cloud, books finished and added per month,
   authors, series and formats.
+* **Updates:** the app updates itself from its GitHub releases, when you ask for it.
 
 The manuals that come with the reader are left out.
 
@@ -23,6 +24,25 @@ The manuals that come with the reader are left out.
    `reading-stats-rk3566.zip` for Verta, InkPad One and PocketBook Q.
 2. Unzip it and copy `Reading Stats.app` into the `applications` folder of the reader.
 3. Open "Reading Stats" from the applications list.
+
+## Updates
+
+"Check for updates", the last row of the start screen, shows the installed version. It looks
+for a newer build on GitHub, says what it is (a release, or a nightly build made from the
+latest changes) and asks before installing it. Close the app and open it again afterwards.
+
+Which updates are offered is set in `system/config/reading-stats.cfg`, with one line:
+
+| Line | Effect |
+|---|---|
+| `updates=all` | Releases and nightly builds. This is the default. |
+| `updates=stable` | Releases only. |
+| `updates=off` | No "Check for updates" row. |
+
+PocketBook ends its settings files with a checksum line (`#1234abcd`) and ignores a file whose
+checksum does not match. After creating or editing the file, add or fix that line with
+`fix-config-checksum.py` from
+[pb-opds-connector](https://github.com/Aluriak/pb-opds-connector/blob/main/scripts/fix-config-checksum.py).
 
 ## How it works
 
