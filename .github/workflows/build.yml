@@ -61,7 +61,7 @@ jobs:
             echo "KIND=$kind"
             echo "RELEASE_TAG=$tag"
             echo "APP_VERSION=$version"
-            echo "ZIGFLAGS=-Dchannel=$kind -Dcommit=$GITHUB_SHA -Dupdate-repo=$GITHUB_REPOSITORY"
+            echo "ZIGFLAGS=-Dchannel=$kind -Dcommit=$GITHUB_SHA"
           } >> "$GITHUB_ENV"
 
       - name: Check that a release tag matches the version

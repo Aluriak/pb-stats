@@ -7,8 +7,6 @@ const library = @import("library.zig");
 const journal = @import("journal.zig");
 const stats = @import("stats.zig");
 const dates = @import("dates.zig");
-const update = @import("update.zig");
-const Policy = @import("update_check.zig").Policy;
 const i18n = @import("i18n.zig");
 const pocketbook = @import("pocketbook.zig");
 const trace = pocketbook.trace;
@@ -47,10 +45,11 @@ const Page = union(enum) {
     /// The sheet of a book, by its index in `books`
     book: usize,
     year: i32,
+    language,
 };
 
-/// What opening a row does: open a page, look for an update, change the language or the goal
-const Action = union(enum) { page: Page, update, language, goal };
+/// What opening a row does: open a page, set the language or the goal
+const Action = union(enum) { page: Page, set_language: i18n.Choice, goal };
 
 /// A list on screen. Opening a row pushes one, Back pops it
 const Screen = struct {
@@ -77,8 +76,8 @@ var title_font: ?*pb.ifont = null;
 var detail_font: ?*pb.ifont = null;
 var heading_font: ?*pb.ifont = null;
 
-/// The app's settings: "updates=stable" (default), "all" (nightly builds too) or "off";
-/// "language=auto" (default, the reader's), "fr" or "en"
+/// The app's settings: "language=auto" (default, the reader's), "fr" or "en"; "goal=", books
+/// to finish this year
 const config_path = "/mnt/ext1/system/config/reading-stats.cfg";
 
 var language: i18n.Choice = .auto;
@@ -128,9 +127,9 @@ fn applyLanguage() void {
     _ = pb.SetSubtaskInfo(pb.GetCurrentTask(), 0, t(.app_title), null);
 }
 
-/// Goes to the next language, keeps it and shows the start screen in it
-fn changeLanguage() void {
-    language = language.next();
+/// Sets the language, keeps it and shows the start screen in it
+fn setLanguage(chosen: i18n.Choice) void {
+    language = chosen;
     if (pb.OpenConfig(config_path, null)) |config| {
         pb.WriteString(config, "language", @tagName(language));
         _ = pb.SaveConfig(config);
@@ -153,16 +152,6 @@ fn rebuildStart() void {
     };
     screens.items[0].pos = @min(pos, startRowCount() - 1);
     showList();
-}
-
-/// Which updates the start screen offers
-var update_policy: Policy = .off;
-
-fn readUpdatePolicy() Policy {
-    if (!update.enabled) return .off;
-    const config = pb.OpenConfig(config_path, null) orelse return .stable;
-    defer pb.CloseConfigNoSave(config);
-    return Policy.parse(std.mem.span(pb.ReadString(config, "updates", "stable")));
 }
 
 const Tm = extern struct {
@@ -214,7 +203,6 @@ fn mainHandler(event_type: c_int, par1: c_int, _: c_int) callconv(.c) c_int {
             detail_font = pb.OpenFont(pb.iv_get_default_font(pb.FONT_STD), @divTrunc(item_height, 5), 1);
             heading_font = pb.OpenFont(pb.iv_get_default_font(pb.FONT_BOLD), @divTrunc(item_height, 5), 1);
 
-            update_policy = readUpdatePolicy();
             loadData() catch |err| {
                 showError(t(.read_error), err);
                 pb.CloseApp();
@@ -254,6 +242,7 @@ fn pushScreen(page: Page) !void {
         .library => .{ t(.library), try libraryRows(allocator) },
         .book => |index| .{ try z(allocator, books[index].title), try bookRows(allocator, books[index]) },
         .year => |year| .{ try i18n.alloc(allocator, .year_title, .{year}), try yearRows(allocator, year) },
+        .language => .{ t(.language_title), try languageRows(allocator) },
     };
     try screens.append(gpa, .{ .arena = arena, .title = title, .rows = list });
 }
@@ -279,12 +268,8 @@ fn listHandler(action: c_int, x: c_int, y: c_int, idx: c_int, state: c_int) call
             const opens = row.opens orelse return 1;
             const page = switch (opens) {
                 .page => |page| page,
-                .update => {
-                    update.checkForUpdate(update_policy);
-                    return 1;
-                },
-                .language => {
-                    changeLanguage();
+                .set_language => |chosen| {
+                    setLanguage(chosen);
                     return 1;
                 },
                 .goal => {
@@ -379,7 +364,24 @@ fn percent(buf: []u8, permille: u16) []const u8 {
     return std.fmt.bufPrint(buf, "{d} %", .{permille / 10}) catch "";
 }
 
-/// The rows of the start screen; the last one sets the language
+fn languageRows(allocator: std.mem.Allocator) ![]const Row {
+    const choices = [_]i18n.Choice{ .auto, .fr, .en };
+    const rows = try allocator.alloc(Row, choices.len);
+    for (choices, rows) |choice, *row| {
+        row.* = .{
+            .title = switch (choice) {
+                .auto => t(.language_auto),
+                .fr => t(.language_fr),
+                .en => t(.language_en),
+            },
+            .detail = if (choice == language) t(.current_choice) else "",
+            .opens = .{ .set_language = choice },
+        };
+    }
+    return rows;
+}
+
+/// The rows of the start screen; the last one opens the languages
 fn startRowCount() c_int {
     return @intCast(screens.items[0].rows.len);
 }
@@ -454,15 +456,6 @@ fn startRows(allocator: std.mem.Allocator) ![]const Row {
         .opens = .{ .page = .library },
     });
 
-    if (update_policy != .off) {
-        var buf: [128]u8 = undefined;
-        try rows.append(allocator, .{
-            .title = t(.check_updates),
-            .detail = try z(allocator, update.describeInstalled(&buf)),
-            .opens = .update,
-        });
-    }
-
     var language_buf: [96]u8 = undefined;
     const chosen = switch (language) {
         .auto => t(.language_auto),
@@ -472,7 +465,7 @@ fn startRows(allocator: std.mem.Allocator) ![]const Row {
     try rows.append(allocator, .{
         .title = try z(allocator, i18n.fmt(&language_buf, .language, .{chosen})),
         .detail = t(.language_change),
-        .opens = .language,
+        .opens = .{ .page = .language },
     });
     return rows.toOwnedSlice(allocator);
 }

@@ -20,7 +20,6 @@ the reader's library and shows:
   streak, and the progress of each book over time.
 * **Library:** books on the reader and in the cloud, books finished and added per month as
   bars, authors, series and formats.
-* **Updates:** the app updates itself from its GitHub releases, when you ask for it.
 
 The manuals that come with the reader are left out.
 
@@ -36,28 +35,19 @@ The manuals that come with the reader are left out.
 
 ## Updates
 
-"Check for updates", the last row of the start screen, shows the installed version. It looks
-for a newer build on GitHub, says what it is (a release, or a nightly build made from the
-latest changes) and asks before installing it. Close the app and open it again afterwards.
-
-Which updates are offered is set in `system/config/reading-stats.cfg`, with one line:
-
-| Line | Effect |
-|---|---|
-| `updates=stable` | Releases only. This is the default. |
-| `updates=all` | Releases and nightly builds, which are made from every change and less tested. |
-| `updates=off` | No "Check for updates" row. |
-
-PocketBook ends its settings files with a checksum line (`#1234abcd`) and ignores a file whose
-checksum does not match. After creating or editing the file, add or fix that line with
-`fix-config-checksum.py` from
-[pb-opds-connector](https://github.com/Aluriak/pb-opds-connector/blob/main/scripts/fix-config-checksum.py).
+Install and update the app with the [App Manager](https://github.com/Aluriak/pb-apps), which
+follows the stable releases of this repository, or its nightly builds if you choose so.
 
 ## Language
 
 The app speaks English or French. By default it follows the reader's language; the last row of
-the start screen switches between the reader's language, French and English. The choice is kept
+the start screen opens a page to choose the reader's language, French or English. The choice is kept
 in `system/config/reading-stats.cfg` as `language=auto`, `fr` or `en`.
+
+PocketBook ends its settings files with a checksum line (`#1234abcd`) and ignores a file whose
+checksum does not match. After editing the file by hand, add or fix that line with
+`fix-config-checksum.py` from
+[pb-opds-connector](https://github.com/Aluriak/pb-opds-connector/blob/main/scripts/fix-config-checksum.py).
 
 ## How it works
 
