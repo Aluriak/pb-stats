@@ -35,8 +35,8 @@ Which updates are offered is set in `system/config/reading-stats.cfg`, with one 
 
 | Line | Effect |
 |---|---|
-| `updates=all` | Releases and nightly builds. This is the default. |
-| `updates=stable` | Releases only. |
+| `updates=stable` | Releases only. This is the default. |
+| `updates=all` | Releases and nightly builds, which are made from every change and less tested. |
 | `updates=off` | No "Check for updates" row. |
 
 PocketBook ends its settings files with a checksum line (`#1234abcd`) and ignores a file whose

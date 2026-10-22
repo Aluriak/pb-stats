@@ -63,9 +63,9 @@ var update_policy: Policy = .off;
 
 fn readUpdatePolicy() Policy {
     if (!update.enabled) return .off;
-    const config = pb.OpenConfig(config_path, null) orelse return .all;
+    const config = pb.OpenConfig(config_path, null) orelse return .stable;
     defer pb.CloseConfigNoSave(config);
-    return Policy.parse(std.mem.span(pb.ReadString(config, "updates", "all")));
+    return Policy.parse(std.mem.span(pb.ReadString(config, "updates", "stable")));
 }
 
 const Tm = extern struct {
