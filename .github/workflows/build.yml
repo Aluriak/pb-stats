@@ -1,0 +1,115 @@
+# Checks and builds the app on every push. Each push to main replaces the "nightly"
+# release, so the latest build is always at the same address:
+# https://github.com/<owner>/<repo>/releases/download/nightly/reading-stats-<platform>.zip
+# A tag v<version> (matching build.zig.zon) publishes a release.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: 0.17.0
+
+permissions:
+  contents: write
+
+# Two pushes in a row must not replace the nightly release at the same time
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          sudo mkdir -p /opt/zig
+          sudo tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo /opt/zig >> "$GITHUB_PATH"
+
+      - name: Decide the kind of build
+        run: |
+          version="$(sed -n 's/^ *\.version = "\(.*\)",.*/\1/p' build.zig.zon)"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$GITHUB_REF_NAME" ]; then
+            kind=release
+          elif [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            kind=nightly
+          else
+            kind=dev
+          fi
+          {
+            echo "KIND=$kind"
+            echo "APP_VERSION=$version"
+            echo "ZIGFLAGS=-Dcommit=$GITHUB_SHA"
+          } >> "$GITHUB_ENV"
+
+      - name: Check that a release tag matches the version
+        if: env.KIND == 'release'
+        run: |
+          if [ "$GITHUB_REF_NAME" != "v$APP_VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match version $APP_VERSION in build.zig.zon"
+            exit 1
+          fi
+
+      - name: Format
+        run: make fmt-check
+
+      - name: Tests
+        run: make test
+
+      - name: Build
+        run: make build-all ZIGFLAGS="$ZIGFLAGS"
+
+      - name: Build for debugging
+        run: |
+          # Debug builds write a log, see "Debugging" in the README
+          for platform in allwinner rk3566; do
+            zig build -Dplatform=$platform $ZIGFLAGS --prefix zig-out/debug-$platform
+            mv "zig-out/debug-$platform/bin/Reading Stats.app" "zig-out/debug-$platform/bin/Reading Stats.bin"
+            cp scripts/stats-debug.app zig-out/debug-$platform/bin/
+          done
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          for platform in allwinner rk3566; do
+            (cd zig-out/$platform/bin && zip -9 "$GITHUB_WORKSPACE/dist/reading-stats-$platform.zip" "Reading Stats.app")
+            (cd zig-out/debug-$platform/bin && zip -9 "$GITHUB_WORKSPACE/dist/reading-stats-$platform-debug.zip" "Reading Stats.bin" stats-debug.app)
+          done
+          ls -la dist
+
+      - name: Keep the files of this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: reading-stats-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish as nightly release
+        if: env.KIND == 'nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --cleanup-tag --yes || true
+          gh release create nightly dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Nightly build" \
+            --notes "Latest build of main, commit ${GITHUB_SHA::7}. Unzip and copy \`Reading Stats.app\` into the \`applications\` folder of your PocketBook."
+
+      - name: Publish the release
+        if: env.KIND == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Version ${APP_VERSION}. Unzip and copy \`Reading Stats.app\` into the \`applications\` folder of your PocketBook."
